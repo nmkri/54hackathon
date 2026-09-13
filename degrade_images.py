@@ -7,13 +7,14 @@ import numpy as np
 import albumentations as A
 from tqdm import tqdm
 
-INPUT_JSON = "truck_dataset.json"          # File containing your original JSON list
-OUTPUT_JSON = "degraded_truck_dataset.json" # Output JSON with degraded image paths
-OUTPUT_IMAGE_DIR = "degraded_truck_images"  # Where corrupted images are saved
+INPUT_DIR = "downloaded_truck_images"        # Directory containing clean source images
+OUTPUT_IMAGE_DIR = "degraded_truck_images"   # Where degraded images will be saved
+OUTPUT_JSON = "degraded_truck_dataset.json"  # Standalone degraded evaluation JSON file
+SAMPLES_PER_CATEGORY = 100                   # Number of samples generated per defect type
 
 os.makedirs(OUTPUT_IMAGE_DIR, exist_ok=True)
 
-# 1. Lens Blur & Severe Defocus
+# 1. Blur Pipeline (Severe lens blur, defocus, motion blur)
 heavy_blur_pipeline = A.Compose([
     A.OneOf([
         A.GaussianBlur(blur_limit=(35, 55), p=1.0),
@@ -22,29 +23,30 @@ heavy_blur_pipeline = A.Compose([
     ], p=1.0)
 ])
 
-# 2. Severe Underexposure
+# 2. Underexposure (Dark night yard / unlit environment)
 dark_pipeline = A.Compose([
     A.RandomBrightnessContrast(brightness_limit=(-0.85, -0.65), contrast_limit=(-0.4, -0.1), p=1.0),
     A.GaussNoise(var_limit=(50.0, 120.0), p=1.0)
 ])
 
-# 3. Severe Overexposure / Sunlight Flare
+# 3. Overexposure (Direct headlight/sunlight glare washout)
 glare_pipeline = A.Compose([
     A.RandomBrightnessContrast(brightness_limit=(0.6, 0.85), contrast_limit=(0.3, 0.6), p=1.0),
     A.RandomSunFlare(flare_roi=(0, 0, 1, 0.6), angle_lower=0.5, src_radius=150, p=0.8)
 ])
 
-# 4. Severe Downsampling / Pixelation
+# 4. Pixelation (Severe downsampling / thumbnail scaling)
 pixelate_pipeline = A.Compose([
     A.Downscale(scale_range=(0.05, 0.12), interpolation_pair={"downscale": cv2.INTER_NEAREST, "upscale": cv2.INTER_NEAREST}, p=1.0)
 ])
 
-# 5. Extreme JPEG Compression
+# 5. Severe JPEG Compression (Messaging app re-encoding artifacts)
 compression_pipeline = A.Compose([
     A.ImageCompression(quality_range=(3, 8), compression_type="jpeg", p=1.0)
 ])
 
 def apply_image_sharding(img: np.ndarray) -> np.ndarray:
+    """Simulates corrupt network packets, missing file blocks, and scanline errors."""
     corrupted = img.copy()
     h, w, c = corrupted.shape
     num_shards = random.randint(3, 7)
@@ -72,56 +74,84 @@ def apply_image_sharding(img: np.ndarray) -> np.ndarray:
 
     return corrupted
 
-DEGRADATION_MODES = [
-    ("blur", lambda img: heavy_blur_pipeline(image=img)["image"]),
-    ("sharded", apply_image_sharding),
-    ("underexposed", lambda img: dark_pipeline(image=img)["image"]),
-    ("overexposed", lambda img: glare_pipeline(image=img)["image"]),
-    ("pixelated", lambda img: pixelate_pipeline(image=img)["image"]),
-    ("compressed", lambda img: compression_pipeline(image=img)["image"])
-]
+def apply_bad_framing(img: np.ndarray) -> np.ndarray:
+    """Simulates poorly framed user uploads where the vehicle is largely out of view."""
+    h, w = img.shape[:2]
+    mode = random.choice(["edge_crop", "corner_slice", "extreme_offset"])
 
-def degrade_and_update_json():
-    with open(INPUT_JSON, "r", encoding="utf-8") as f:
-        data = json.load(f)
+    if mode == "edge_crop":
+        if random.random() > 0.5:
+            y_start = 0 if random.random() > 0.5 else int(h * 0.75)
+            y_end = int(h * 0.25) if y_start == 0 else h
+            cropped = img[y_start:y_end, :]
+        else:
+            x_start = 0 if random.random() > 0.5 else int(w * 0.75)
+            x_end = int(w * 0.25) if x_start == 0 else w
+            cropped = img[:, x_start:x_end]
 
-    # Ensure we work with a list of listing objects
-    records = data if isinstance(data, list) else [data]
+    elif mode == "corner_slice":
+        crop_h, crop_w = int(h * random.uniform(0.18, 0.32)), int(w * random.uniform(0.18, 0.32))
+        y_start = 0 if random.random() > 0.5 else (h - crop_h)
+        x_start = 0 if random.random() > 0.5 else (w - crop_w)
+        cropped = img[y_start:y_start + crop_h, x_start:x_start + crop_w]
+
+    elif mode == "extreme_offset":
+        shift_x = int(w * random.choice([-0.68, 0.68]))
+        shift_y = int(h * random.choice([-0.68, 0.68]))
+        matrix = np.float32([[1, 0, shift_x], [0, 1, shift_y]])
+        return cv2.warpAffine(img, matrix, (w, h), borderMode=cv2.BORDER_CONSTANT, borderValue=(0, 0, 0))
+
+    return cv2.resize(cropped, (w, h), interpolation=cv2.INTER_LINEAR)
+
+DEGRADATION_MODES = {
+    "heavy_blur": lambda img: heavy_blur_pipeline(image=img)["image"],
+    "sharded_corrupt": apply_image_sharding,
+    "bad_framing": apply_bad_framing,
+    "extreme_underexposed": lambda img: dark_pipeline(image=img)["image"],
+    "extreme_overexposed": lambda img: glare_pipeline(image=img)["image"],
+    "heavy_pixelation": lambda img: pixelate_pipeline(image=img)["image"],
+    "heavy_compression": lambda img: compression_pipeline(image=img)["image"]
+}
+
+def generate_degraded_dataset():
+    input_path = Path(INPUT_DIR)
+    all_images = list(input_path.glob("*.jpg")) + list(input_path.glob("*.png")) + list(input_path.glob("*.jpeg"))
+    
+    if not all_images:
+        print(f"No source images found in '{INPUT_DIR}'. Verify your directory.")
+        return
+
     degraded_records = []
+    sample_counter = 1
 
-    for entry in tqdm(records, desc="Processing Listings"):
-        new_entry = dict(entry)  # Preserve original metadata keys (id, brand, price, currency, etc.)
-        image_key = "images" if "images" in new_entry else "image_urls"
-        original_images = new_entry.get(image_key, [])
-        new_image_paths = []
+    for mode_name, transform_fn in DEGRADATION_MODES.items():
+        sampled = random.sample(all_images, min(SAMPLES_PER_CATEGORY, len(all_images)))
 
-        for idx, img_path in enumerate(original_images):
-            # Load local image
-            img = cv2.imread(img_path)
+        for idx, img_file in enumerate(tqdm(sampled, desc=f"Generating {mode_name}")):
+            img = cv2.imread(str(img_file))
             if img is None:
-                # If path is missing or unreadable, retain path and continue
-                new_image_paths.append(img_path)
                 continue
 
-            # Pick a corruption method at random
-            mode_name, transform_fn = random.choice(DEGRADATION_MODES)
             corrupted_img = transform_fn(img)
-
-            # Generate target corrupted file name
-            orig_name = Path(img_path).stem
-            dest_filename = f"{orig_name}_{mode_name}_{idx}.jpg"
-            dest_path = Path(OUTPUT_IMAGE_DIR) / dest_filename
-
+            out_filename = f"{img_file.stem}_{mode_name}_{idx}.jpg"
+            dest_path = Path(OUTPUT_IMAGE_DIR) / out_filename
             cv2.imwrite(str(dest_path), corrupted_img)
-            new_image_paths.append(dest_path.as_posix())
 
-        new_entry[image_key] = new_image_paths
-        degraded_records.append(new_entry)
+            degraded_records.append({
+                "id": f"degraded_sample_{sample_counter:04d}",
+                "brand": "UNKNOWN",
+                "price": None,
+                "currency": "USD",
+                "images": [dest_path.as_posix()]
+            })
+            sample_counter += 1
 
     with open(OUTPUT_JSON, "w", encoding="utf-8") as f:
-        json.dump(degraded_records if isinstance(data, list) else degraded_records[0], f, indent=2)
+        json.dump(degraded_records, f, indent=2)
 
-    print(f"\nDone. Updated JSON written to {OUTPUT_JSON} with exact matching schema.")
+    print(f"\nGenerated {len(degraded_records)} degraded samples.")
+    print(f"Images stored in: '{OUTPUT_IMAGE_DIR}/'")
+    print(f"Evaluation metadata written to: '{OUTPUT_JSON}'")
 
 if __name__ == "__main__":
-    degrade_and_update_json()
+    generate_degraded_dataset()
