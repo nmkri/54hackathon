@@ -1,4 +1,4 @@
-"""Stratified sample of 200 TruckPaper images + aggregate part-focused labels."""
+"""Stratified sample of 200 images + aggregate condition scores (1-5)."""
 
 from __future__ import annotations
 
@@ -7,18 +7,35 @@ import random
 from collections import Counter, defaultdict
 from pathlib import Path
 
+from PIL import Image
+
 ROOT = Path(__file__).resolve().parents[1]
 MANIFEST = ROOT / "image_scraper" / "truckpaper_listings.json"
 IMG_ROOT = ROOT / "image_scraper" / "TruckPaper Scraped Images Dataset"
 OUT_DIR = Path(__file__).resolve().parent
-SAMPLE_PATH = OUT_DIR / "sample_200.json"
-LABELS_PATH = OUT_DIR / "primary_subject_labels.jsonl"
-COUNTS_PATH = OUT_DIR / "primary_subject_counts.py"
+
+SAMPLE_PATH = OUT_DIR / "condition_sample_200.json"
+PREVIEWS_DIR = OUT_DIR / "condition_previews"
+LABELS_PATH = OUT_DIR / "condition_labels.jsonl"
+COUNTS_PATH = OUT_DIR / "condition_counts.py"
 
 N = 200
 POS_TARGET = 130
 NEG_TARGET = 70
-SEED = 42
+SEED = 43  # independent from part-label sample
+
+# Locked primary_subject vocabulary (for reference / future joint labeling)
+PRIMARY_SUBJECTS = ("front", "side", "back", "interior", "container", "tire")
+
+# Condition of the visible truck region in the photo
+ALLOWED_CONDITIONS = {1, 2, 3, 4, 5}
+CONDITION_RUBRIC = {
+    1: "Poor — severe damage, heavy rust/rot, bald tires, major collision, missing panels",
+    2: "Bad — significant wear/damage, deep dents, heavy oxidation, uneven/low tread",
+    3: "Fair — average used condition, light scuffs, mild wear, usable as-is",
+    4: "Good — clean, minor cosmetic issues only, solid paint/tires",
+    5: "Excellent — near-new appearance, pristine paint, deep tread, no visible damage",
+}
 
 
 def load_pool() -> dict[str, dict[str, list[dict]]]:
@@ -132,66 +149,65 @@ def build_sample() -> list[dict]:
         rng.shuffle(extras)
         sample.extend(extras[: N - len(sample)])
     for i, s in enumerate(sample):
-        s["sample_id"] = f"sample_{i:03d}"
+        s["sample_id"] = f"cond_{i:03d}"
     assert len(sample) == N
     SAMPLE_PATH.write_text(json.dumps(sample, indent=2), encoding="utf-8")
     return sample
 
 
-def write_counts(labels: list[dict]) -> dict[str, int]:
-    counts = Counter(r["primary_subject"] for r in labels)
-    ordered = dict(sorted(counts.items(), key=lambda kv: (-kv[1], kv[0])))
+def build_previews(sample: list[dict]) -> list[dict]:
+    PREVIEWS_DIR.mkdir(parents=True, exist_ok=True)
+    ok = fail = 0
+    for rec in sample:
+        dest = PREVIEWS_DIR / f"{rec['sample_id']}.jpg"
+        try:
+            im = Image.open(rec["abs_path"]).convert("RGB")
+            im.thumbnail((960, 960))
+            im.save(dest, "JPEG", quality=80)
+            rec["preview_path"] = str(dest)
+            ok += 1
+        except Exception as e:
+            rec["preview_path"] = None
+            fail += 1
+            print(f"preview fail {rec['sample_id']}: {e}")
+    SAMPLE_PATH.write_text(json.dumps(sample, indent=2), encoding="utf-8")
+    print(f"previews ok={ok} fail={fail}")
+    return sample
+
+
+def write_counts(labels: list[dict]) -> dict[int, int]:
+    counts = Counter(int(r["condition"]) for r in labels)
+    ordered = {k: counts[k] for k in sorted(counts)}
     lines = [
-        '"""Part-focused primary_subject counts on a stratified 200-image sample."""',
+        '"""Condition score counts (1-5) on a stratified 200-image sample."""',
         "",
         f"# total = {sum(ordered.values())}",
-        f"# unique labels = {len(ordered)}",
+        f"# unique scores = {len(ordered)}",
         "",
-        "primary_subject_counts = {",
+        "condition_counts = {",
     ]
-    for label, n in ordered.items():
-        lines.append(f"    {label!r}: {n},")
+    for score, n in ordered.items():
+        lines.append(f"    {score}: {n},  # {CONDITION_RUBRIC[score]}")
     lines.append("}")
     lines.append("")
     COUNTS_PATH.write_text("\n".join(lines) + "\n", encoding="utf-8")
     return ordered
 
 
-def load_labels() -> list[dict]:
-    if not LABELS_PATH.exists():
-        return []
-    rows = []
-    for line in LABELS_PATH.read_text(encoding="utf-8").splitlines():
-        if line.strip():
-            rows.append(json.loads(line))
-    return rows
-
-
-ALLOWED = {
-    "front",
-    "side",
-    "back",
-    "interior",
-    "container",
-    "tire",
-}
-
-
-def merge_partials() -> list[dict]:
-    """Merge _partial_*.jsonl into primary_subject_labels.jsonl and counts dict."""
-    partials = sorted(OUT_DIR.glob("_partial_*.jsonl"))
+def merge_partials() -> tuple[list[dict], dict[int, int]]:
+    partials = sorted(OUT_DIR.glob("_cond_partial_*.jsonl"))
     if not partials:
-        raise SystemExit("No _partial_*.jsonl files found yet")
-    by_id: dict[str, str] = {}
+        raise SystemExit("No _cond_partial_*.jsonl files found yet")
+    by_id: dict[str, int] = {}
     for path in partials:
         for line in path.read_text(encoding="utf-8").splitlines():
             if not line.strip():
                 continue
             row = json.loads(line)
-            label = str(row["primary_subject"]).strip().lower()
-            if label not in ALLOWED:
-                raise SystemExit(f"Invalid label {label!r} in {path.name} ({row.get('sample_id')})")
-            by_id[row["sample_id"]] = label
+            score = int(row["condition"])
+            if score not in ALLOWED_CONDITIONS:
+                raise SystemExit(f"Invalid condition {score!r} in {path.name} ({row.get('sample_id')})")
+            by_id[row["sample_id"]] = score
     if len(by_id) != N:
         raise SystemExit(f"Expected {N} labels, got {len(by_id)}")
     sample = json.loads(SAMPLE_PATH.read_text(encoding="utf-8"))
@@ -201,7 +217,7 @@ def merge_partials() -> list[dict]:
         labels.append(
             {
                 "sample_id": sid,
-                "primary_subject": by_id[sid],
+                "condition": by_id[sid],
                 "abs_path": rec["abs_path"],
                 "preview_path": rec.get("preview_path"),
             }
@@ -211,7 +227,6 @@ def merge_partials() -> list[dict]:
         encoding="utf-8",
     )
     counts = write_counts(labels)
-    # delete temporary partials
     for path in partials:
         path.unlink()
     return labels, counts
@@ -222,7 +237,7 @@ def print_validation_examples(labels: list[dict], k: int = 10) -> None:
     picks = rng.sample(labels, k=min(k, len(labels)))
     print("\n=== validation examples (check these images) ===")
     for r in picks:
-        print(f"{r['sample_id']}: {r['primary_subject']}")
+        print(f"{r['sample_id']}: condition={r['condition']}  ({CONDITION_RUBRIC[r['condition']]})")
         print(f"  preview: {r.get('preview_path')}")
         print(f"  source:  {r['abs_path']}")
 
@@ -230,14 +245,11 @@ def print_validation_examples(labels: list[dict], k: int = 10) -> None:
 if __name__ == "__main__":
     import sys
 
-    if len(sys.argv) > 1 and sys.argv[1] == "merge":
-        labels, counts = merge_partials()
-        print(f"wrote {COUNTS_PATH}")
-        print(f"wrote {LABELS_PATH}")
-        print("primary_subject_counts =", counts)
-        print_validation_examples(labels, 10)
-    else:
+    cmd = sys.argv[1] if len(sys.argv) > 1 else "sample"
+
+    if cmd == "sample":
         sample = build_sample()
+        sample = build_previews(sample)
         print(f"wrote {SAMPLE_PATH} n={len(sample)}")
         print(
             "pos",
@@ -245,3 +257,11 @@ if __name__ == "__main__":
             "neg",
             sum(1 for s in sample if "Negative" in s["group"]),
         )
+    elif cmd == "merge":
+        labels, counts = merge_partials()
+        print(f"wrote {COUNTS_PATH}")
+        print(f"wrote {LABELS_PATH}")
+        print("condition_counts =", counts)
+        print_validation_examples(labels, 10)
+    else:
+        raise SystemExit("usage: label_conditions.py [sample|merge]")
